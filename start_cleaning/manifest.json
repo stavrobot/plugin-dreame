@@ -1,0 +1,7 @@
+{
+  "name": "start_cleaning",
+  "description": "Tell the Dreame vacuum to start cleaning the whole house, or to resume a job that was paused. Does not choose the cleaning mode: use set_cleaning_mode first if the mode matters.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}

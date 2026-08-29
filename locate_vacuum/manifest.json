@@ -1,0 +1,7 @@
+{
+  "name": "locate_vacuum",
+  "description": "Make the Dreame vacuum announce out loud where it is, so a lost robot can be found. It does not move the vacuum and does not change what it is doing.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}

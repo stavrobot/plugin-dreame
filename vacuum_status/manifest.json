@@ -1,0 +1,7 @@
+{
+  "name": "vacuum_status",
+  "description": "Get the current state of the Dreame vacuum: battery, what it is doing, water tank, cleaning mode and any error.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}

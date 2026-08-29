@@ -1,0 +1,12 @@
+{
+  "name": "set_cleaning_mode",
+  "description": "Set the cleaning mode the Dreame vacuum will use. This only changes the mode setting, it does not start a clean.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {
+    "mode": {
+      "type": "string",
+      "description": "The cleaning mode to set: sweep (vacuum only), mop (mop only), sweep_and_mop (both at once) or mop_after_sweep (vacuum the whole area first, then mop it)."
+    }
+  }
+}

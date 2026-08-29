@@ -1,0 +1,7 @@
+{
+  "name": "pause_cleaning",
+  "description": "Pause the Dreame vacuum where it stands, leaving the current job resumable. It stays put rather than returning to its dock; use start_cleaning to carry on or return_to_dock to send it home.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}

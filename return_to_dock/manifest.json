@@ -1,0 +1,7 @@
+{
+  "name": "return_to_dock",
+  "description": "Send the Dreame vacuum back to its dock to charge, ending whatever it is doing. Use this to stop cleaning for good; use pause_cleaning to interrupt a job you intend to resume.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}
