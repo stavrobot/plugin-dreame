@@ -1,6 +1,7 @@
 {
   "name": "dreame",
   "description": "Control a Dreame robot vacuum through the Dreame cloud.",
+  "summary": "Control Dreame robot vacuums",
   "instructions": "- Fill in username and password; set account_type to the app you registered the vacuum in and country to the region the ACCOUNT was created in, not where you live. A wrong region looks like a wrong password, or gives an empty device list.\n- Region support differs by brand: dreame supports eu, us, cn, sg, ru, kr; mova supports eu, us, cn, sg; trouver supports eu, us, ru, sg.\n- Press a button on the robot to wake it before the first command. A sleeping vacuum drops its WiFi link and the cloud then rejects commands with error 80001.\n- The plugin handles one vacuum per account.\n- Setup runs in the background for up to a minute after install. Tools report that setup is still running until it finishes.",
   "init": {
     "entrypoint": "init.py",
