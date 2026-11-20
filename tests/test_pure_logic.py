@@ -16,6 +16,8 @@ run under a temporary HOME because the cache location follows it.
 
 Run with: uv run tests/test_pure_logic.py
 """
+import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -23,7 +25,10 @@ import stat
 import sys
 import tempfile
 import time
+import zlib
 from contextlib import contextmanager
+
+from Crypto.Cipher import AES
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -930,6 +935,678 @@ ACTION_OUTCOMES = (
 for label, response, expected in ACTION_OUTCOMES:
     outcome = acted(response)
     check(label, outcome == expected, detail=repr(outcome))
+
+# ---------------------------------------------------------------------------
+# 9. Map decoding and room names. The map format is the only part of this
+#    plugin that parses opaque bytes from the cloud, so these checks build
+#    synthetic maps and pin the room-ID and naming rules. No real map data,
+#    room name or device ID appears here.
+# ---------------------------------------------------------------------------
+MAP_WIDTH = 4
+MAP_HEIGHT = 2
+
+
+def map_text(pixels, data_json, key=None, iv_index=0):
+    """Build a map payload the way the robot and cloud send it."""
+    header = bytearray(_dreame.MAP_HEADER_SIZE)
+    header[19:21] = MAP_WIDTH.to_bytes(2, "little", signed=True)
+    header[21:23] = MAP_HEIGHT.to_bytes(2, "little", signed=True)
+    raw = bytes(header) + bytes(pixels) + json.dumps(data_json).encode("utf-8")
+    compressed = zlib.compress(raw)
+
+    if key is None:
+        encoded = base64.b64encode(compressed).decode("ascii")
+    else:
+        aes_key = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32].encode("ascii")
+        iv = _dreame.MAP_AES_IVS[iv_index].encode("ascii")
+        padding = b"\0" * (-len(compressed) % 16)
+        encrypted = AES.new(aes_key, AES.MODE_CBC, iv).encrypt(compressed + padding)
+        encoded = base64.b64encode(encrypted).decode("ascii")
+
+    # The cloud uses the URL-safe alphabet and the decoder maps it back.
+    return encoded.replace("+", "-").replace("/", "_")
+
+
+def custom_name(text):
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+SEG_INF = {
+    # Known type, first of its type: no number suffix.
+    "1": {"type": 4, "index": 0},
+    # Known type, second of its type: upstream appends index + 1.
+    "2": {"type": 2, "index": 1},
+    # Type zero falls through to the app's custom room name.
+    "3": {"type": 0, "name": custom_name("My Room")},
+    # An unknown nonzero type also falls through to the custom name.
+    "5": {"type": 99, "name": custom_name("Unknown Type")},
+    # Room 4 has no seg_inf entry at all and must become "Room 4".
+}
+NAMED_PIXELS = bytes([0x81, 2, 3, 4, 5, 0, 0, 0])
+EXPECTED_ROOMS = [
+    {"id": 1, "name": "Kitchen"},
+    {"id": 2, "name": "Primary Bedroom 2"},
+    {"id": 3, "name": "My Room"},
+    {"id": 4, "name": "Room 4"},
+    {"id": 5, "name": "Unknown Type"},
+]
+
+rooms = _dreame.map_rooms(map_text(NAMED_PIXELS, {"seg_inf": SEG_INF}))
+check(
+    "9a: a plain map decodes to sorted rooms with all three naming rules",
+    rooms == EXPECTED_ROOMS,
+    detail=repr(rooms),
+)
+
+# A map pixel's low six bits are the room ID; the high bits are flags and must
+# not create extra rooms or shift the ID.
+check(
+    "9b: the room ID is pixel & 0x3F and 0 is not a room",
+    [room["id"] for room in rooms] == [1, 2, 3, 4, 5],
+    detail=repr(rooms),
+)
+
+# The first IV in the tuple is the obvious one to keep working; the encrypted
+# check below deliberately uses a later IV so trying only the first would fail.
+ENCRYPTED_KEY = "syntheticmapkey"
+ENCRYPTED_TEXT = map_text(
+    NAMED_PIXELS, {"seg_inf": SEG_INF}, key=ENCRYPTED_KEY, iv_index=6
+)
+check(
+    "9c: an encrypted map decodes with a non-first IV",
+    _dreame.map_rooms(ENCRYPTED_TEXT, ENCRYPTED_KEY) == EXPECTED_ROOMS,
+    detail=repr(_dreame.map_rooms(ENCRYPTED_TEXT, ENCRYPTED_KEY)),
+)
+check(
+    "9d: an inline key after a comma is split off and used",
+    _dreame.map_rooms(f"{ENCRYPTED_TEXT},{ENCRYPTED_KEY}") == EXPECTED_ROOMS,
+)
+
+# A live frame embeds the saved map as "rism", in the same encoding and always
+# without a key. The saved map's rooms are the ones the app shows, so the
+# outer frame's own pixels must be ignored.
+INNER_TEXT = map_text(
+    bytes([2, 2, 1, 0, 1, 0, 0, 0]),
+    {"seg_inf": {"1": {"type": 4, "index": 0}, "2": {"type": 6, "index": 0}}},
+)
+OUTER_TEXT = map_text(
+    NAMED_PIXELS, {"seg_inf": SEG_INF, "rism": INNER_TEXT}
+)
+rooms = _dreame.map_rooms(OUTER_TEXT)
+check(
+    "9e: rooms come from the nested rism map, not the frame",
+    rooms == [{"id": 1, "name": "Kitchen"}, {"id": 2, "name": "Bathroom"}],
+    detail=repr(rooms),
+)
+
+# A nested saved map is decoded without a key even when the outer map had one.
+check(
+    "9f: an encrypted outer frame still decodes its nested rism map",
+    _dreame.map_rooms(
+        map_text(NAMED_PIXELS, {"rism": INNER_TEXT}, key=ENCRYPTED_KEY), ENCRYPTED_KEY
+    )
+    == [{"id": 1, "name": "Kitchen"}, {"id": 2, "name": "Bathroom"}],
+)
+
+
+def map_error(payload, key=None):
+    """Return the ToolError text map_rooms() raises, or None."""
+    try:
+        _dreame.map_rooms(payload, key)
+    except ToolError as err:
+        return str(err)
+    except Exception as err:  # noqa: BLE001 - only ToolError may escape.
+        return f"raised {type(err).__name__}"
+    return None
+
+
+EMPTY_MAP = map_text(bytes(MAP_WIDTH * MAP_HEIGHT), {"seg_inf": SEG_INF})
+GARBAGE_MAPS = (
+    ("9g: an empty payload", ""),
+    ("9h: a payload that is too short", "!!"),
+    ("9i: base64 that is not zlib", base64.b64encode(b"not a map").decode("ascii")),
+    ("9j: a truncated header", base64.b64encode(zlib.compress(b"\0" * 10)).decode("ascii")),
+    ("9k: a map with no room pixels", EMPTY_MAP),
+)
+for label, payload in GARBAGE_MAPS:
+    message = map_error(payload)
+    check(
+        f"{label} is the fixed map ToolError",
+        message == _dreame.MAP_UNAVAILABLE_MESSAGE,
+        detail=repr(message),
+    )
+
+message = map_error(ENCRYPTED_TEXT, "the-wrong-key")
+check(
+    "9l: a key no IV decrypts is the fixed map ToolError",
+    message == _dreame.MAP_UNAVAILABLE_MESSAGE,
+    detail=repr(message),
+)
+
+# An unreadable rism must fail rather than silently falling back to the frame:
+# the frame's rooms are often stale or partial.
+message = map_error(map_text(NAMED_PIXELS, {"seg_inf": SEG_INF, "rism": "!!!"}))
+check(
+    "9m: an undecodable rism fails instead of using the frame",
+    message == _dreame.MAP_UNAVAILABLE_MESSAGE,
+    detail=repr(message),
+)
+
+# ---------------------------------------------------------------------------
+# 10. CleanGenius parsing and the cleaning-mode write plan. set_cleaning_mode
+#     is never run against the robot in testing, so the decision about what to
+#     send has to be pinned here instead.
+# ---------------------------------------------------------------------------
+AUTO_SWITCH_KEY = (
+    PROPERTY_MAPPING[PROPERTY_ENUM.AUTO_SWITCH_SETTINGS]["siid"],
+    PROPERTY_MAPPING[PROPERTY_ENUM.AUTO_SWITCH_SETTINGS]["piid"],
+)
+MODE_KEY = (
+    PROPERTY_MAPPING[PROPERTY_ENUM.CLEANING_MODE]["siid"],
+    PROPERTY_MAPPING[PROPERTY_ENUM.CLEANING_MODE]["piid"],
+)
+
+
+def auto_switch_settings(**values):
+    """Build the AUTO_SWITCH_SETTINGS JSON string with the given k/v pairs."""
+    return json.dumps([{"k": key, "v": value} for key, value in values.items()])
+
+
+check(
+    "10a: SmartHost 0 is off",
+    not _dreame.clean_genius_on(auto_switch_settings(SmartHost=0)),
+)
+check(
+    "10b: SmartHost 1 is on",
+    _dreame.clean_genius_on(auto_switch_settings(SmartHost=1)),
+)
+check(
+    "10c: SmartHost 2 is on",
+    _dreame.clean_genius_on(auto_switch_settings(SmartHost=2, Other=-7)),
+)
+check(
+    "10d: a negative SmartHost is off",
+    not _dreame.clean_genius_on(auto_switch_settings(SmartHost=-1)),
+)
+check(
+    "10e: a single setting object is accepted",
+    _dreame.clean_genius_on(json.dumps({"k": "SmartHost", "v": 1}))
+    and not _dreame.clean_genius_on(json.dumps({"k": "SmartHost", "v": 0})),
+)
+check(
+    "10f: a list without SmartHost is off",
+    not _dreame.clean_genius_on(auto_switch_settings(Other=1)),
+)
+UNUSABLE_AUTO_SWITCH = (
+    ("10g: an absent value", None),
+    ("10h: a non-string value", 36),
+    ("10i: an empty string", ""),
+    ("10j: an unparsable string", "not json"),
+    ("10k: a JSON number", "1"),
+    ("10l: a list of non-objects", "[1, 2]"),
+    ("10m: SmartHost with a string value", json.dumps([{"k": "SmartHost", "v": "1"}])),
+    ("10n: SmartHost with a bool value", json.dumps([{"k": "SmartHost", "v": True}])),
+    ("10o: SmartHost with a null value", json.dumps([{"k": "SmartHost", "v": None}])),
+)
+for label, value in UNUSABLE_AUTO_SWITCH:
+    check(f"{label} is off", not _dreame.clean_genius_on(value))
+
+DEVICE = 1234567890
+MODE_ON = auto_switch_settings(SmartHost=1, Other=-7)
+MODE_OFF = auto_switch_settings(SmartHost=0, Other=-7)
+
+plan = _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "sweep", False, MODE_OFF)
+check(
+    "10p: a mode change alone writes only the packed mode",
+    plan == {
+        "payload": [
+            {
+                "did": str(DEVICE),
+                "siid": MODE_KEY[0],
+                "piid": MODE_KEY[1],
+                "value": PACKED & ~0x03,
+            }
+        ],
+        "changed": True,
+        "clean_genius_off": False,
+    },
+    detail=repr(plan),
+)
+
+plan = _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "sweep", False, MODE_ON)
+check(
+    "10q: CleanGenius on adds the off write in the same payload",
+    plan["changed"] is True
+    and plan["clean_genius_off"] is True
+    and len(plan["payload"]) == 2
+    and plan["payload"][1]
+    == {
+        "did": str(DEVICE),
+        "siid": AUTO_SWITCH_KEY[0],
+        "piid": AUTO_SWITCH_KEY[1],
+        "value": _dreame.CLEAN_GENIUS_OFF_VALUE,
+    },
+    detail=repr(plan),
+)
+check(
+    "10r: the CleanGenius value is the exact compact wire string",
+    plan["payload"][1]["value"] == '{"k":"SmartHost","v":0}',
+    detail=repr(plan["payload"][1]["value"]),
+)
+
+# "mop" encodes to wire value 1, which is what PACKED's low bits already are.
+plan = _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "mop", False, MODE_ON)
+check(
+    "10s: an unchanged mode still writes the CleanGenius off entry",
+    plan["changed"] is False
+    and plan["clean_genius_off"] is True
+    and len(plan["payload"]) == 1
+    and plan["payload"][0]["piid"] == AUTO_SWITCH_KEY[1],
+    detail=repr(plan),
+)
+
+plan = _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "mop", False, MODE_OFF)
+check(
+    "10t: nothing is written when neither the mode nor CleanGenius changes",
+    plan == {"payload": [], "changed": False, "clean_genius_off": False},
+    detail=repr(plan),
+)
+
+try:
+    _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "scrub", False, MODE_ON)
+    check("10u: an unknown mode is still rejected", False)
+except ToolError as err:
+    check("10u: an unknown mode is still rejected", "sweep_and_mop" in str(err))
+
+# The batch setter must send exactly the plan in one call, with no retries.
+BATCH = _dreame.cleaning_mode_write_plan(DEVICE, PACKED, "sweep", False, MODE_ON)["payload"]
+cloud = StubCloud([{"code": 0}])
+_dreame.set_props(cloud, BATCH, _dreame.deadline())
+check(
+    "10v: the batch setter sends the whole plan in one call",
+    len(cloud.sent) == 1
+    and cloud.sent[0]["method"] == "set_properties"
+    and cloud.sent[0]["retry_count"] == 0
+    and cloud.sent[0]["parameters"] == BATCH,
+    detail=repr(cloud.sent),
+)
+try:
+    _dreame.set_props(StubCloud([{"code": -4004}]), BATCH, _dreame.deadline())
+    check("10w: a refused batch is still an error", False)
+except ToolError as err:
+    check(
+        "10w: a refused batch is still an error",
+        str(err) == _dreame.COMMAND_REFUSED_MESSAGE,
+    )
+
+# ---------------------------------------------------------------------------
+# 11. clean_rooms parameter validation and payload building. The tool moves the
+#     robot, so it is never run against the real vacuum in testing.
+# ---------------------------------------------------------------------------
+check(
+    "11a: valid IDs are de-duplicated and keep their order",
+    _dreame.parse_room_ids({"rooms": [3, 1, 3, 2, 1]}) == [3, 1, 2],
+)
+check(
+    "11b: the full 1..63 range is accepted",
+    _dreame.parse_room_ids({"rooms": [1, 63]}) == [1, 63],
+)
+
+REJECTED_ROOM_PARAMETERS = (
+    ("11c: a missing rooms key", {}),
+    ("11d: a null rooms value", {"rooms": None}),
+    ("11e: an empty list", {"rooms": []}),
+    ("11f: a non-list value", {"rooms": 3}),
+    ("11g: a string value", {"rooms": "3"}),
+    ("11h: a bool in the list", {"rooms": [True]}),
+    ("11i: a float in the list", {"rooms": [3.0]}),
+    ("11j: a string in the list", {"rooms": ["3"]}),
+    ("11k: zero is out of range", {"rooms": [0]}),
+    ("11l: 64 is out of range", {"rooms": [64]}),
+    ("11m: a negative ID is out of range", {"rooms": [-1]}),
+)
+for label, parameters in REJECTED_ROOM_PARAMETERS:
+    try:
+        _dreame.parse_room_ids(parameters)
+        check(f"{label} is rejected", False)
+    except ToolError as err:
+        check(
+            f"{label} is rejected with the fixed message",
+            str(err) == _dreame.ROOMS_PARAMETER_MESSAGE,
+            detail=str(err),
+        )
+
+for label, parameters in (("11n: a list", [1]), ("11o: a string", "rooms")):
+    try:
+        _dreame.parse_room_ids(parameters)
+        check(f"{label} is not a parameter object", False)
+    except ToolError:
+        check(f"{label} is not a parameter object", True)
+
+SUCTION = 1
+WATER = 2
+STATUS_PIID = PROPERTY_MAPPING[PROPERTY_ENUM.STATUS]["piid"]
+CLEANING_PROPERTIES_PIID = PROPERTY_MAPPING[PROPERTY_ENUM.CLEANING_PROPERTIES]["piid"]
+
+inputs = _dreame.clean_rooms_inputs([2, 5], SUCTION, WATER, True)
+check(
+    "11p: a customized-cleaning robot gets order 1 for every room",
+    inputs
+    == [
+        {"piid": STATUS_PIID, "value": 18},
+        {
+            "piid": CLEANING_PROPERTIES_PIID,
+            "value": '{"selects":[[2,1,1,2,1],[5,1,1,2,1]]}',
+        },
+    ],
+    detail=repr(inputs),
+)
+check(
+    "11q: the status input is SEGMENT_CLEANING (18)",
+    inputs[0]["value"] == _dreame.DreameVacuumStatus.SEGMENT_CLEANING.value == 18,
+)
+
+inputs = _dreame.clean_rooms_inputs([2, 5], SUCTION, WATER, False)
+check(
+    "11r: without customized cleaning the order is the 1-based position",
+    inputs[1]["value"] == '{"selects":[[2,1,1,2,1],[5,1,1,2,2]]}',
+    detail=repr(inputs),
+)
+
+inputs = _dreame.clean_rooms_inputs([9], 3, 0, True)
+check(
+    "11s: one room builds one select",
+    inputs[1]["value"] == '{"selects":[[9,1,3,0,1]]}',
+    detail=repr(inputs),
+)
+
+# ---------------------------------------------------------------------------
+# 12. Map fetch path. The decoder is covered above, but the cloud plumbing that
+#     chooses between an inline map and a file, resolves the URL and downloads
+#     it only ever ran on one branch against the robot. These checks use a stub
+#     cloud so every branch runs offline, with no real names, IDs or URLs.
+# ---------------------------------------------------------------------------
+MAP_DATA_PIID = PROPERTY_MAPPING[PROPERTY_ENUM.MAP_DATA]["piid"]
+OBJECT_NAME_PIID = PROPERTY_MAPPING[PROPERTY_ENUM.OBJECT_NAME]["piid"]
+OLD_MAP_DATA_PIID = PROPERTY_MAPPING[PROPERTY_ENUM.OLD_MAP_DATA]["piid"]
+NO_SOURCE = (None, None, None)
+
+
+def map_out(*entries):
+    """Build a REQUEST_MAP action result from (piid, value) pairs."""
+    return {"code": 0, "out": [{"piid": piid, "value": value} for piid, value in entries]}
+
+
+check(
+    "12a: inline MAP_DATA wins over OBJECT_NAME",
+    _dreame._map_source(
+        map_out((OBJECT_NAME_PIID, "mapobject"), (MAP_DATA_PIID, "rawmap"))
+    )
+    == ("rawmap", None, None),
+)
+check(
+    "12b: OBJECT_NAME alone is returned for the URL step",
+    _dreame._map_source(map_out((OBJECT_NAME_PIID, "mapobject")))
+    == (None, "mapobject", None),
+)
+check(
+    "12c: OLD_MAP_DATA kind 0 is an inline map",
+    _dreame._map_source(map_out((OLD_MAP_DATA_PIID, "0,oldraw")))
+    == ("oldraw", None, None),
+)
+check(
+    "12d: OLD_MAP_DATA kind 1 is a file name",
+    _dreame._map_source(map_out((OLD_MAP_DATA_PIID, "1,oldname")))
+    == (None, "oldname", None),
+)
+check(
+    "12e: OLD_MAP_DATA kind 1 carries an optional key",
+    _dreame._map_source(map_out((OLD_MAP_DATA_PIID, "1,oldname,oldkey")))
+    == (None, "oldname", "oldkey"),
+)
+check(
+    "12f: OLD_MAP_DATA is ignored when OBJECT_NAME is present",
+    _dreame._map_source(
+        map_out(
+            (OLD_MAP_DATA_PIID, "0,oldraw"), (OBJECT_NAME_PIID, "mapobject")
+        )
+    )
+    == (None, "mapobject", None),
+)
+check(
+    "12g: OLD_MAP_DATA is ignored when inline MAP_DATA is present",
+    _dreame._map_source(
+        map_out((OLD_MAP_DATA_PIID, "1,oldname,oldkey"), (MAP_DATA_PIID, "rawmap"))
+    )
+    == ("rawmap", None, None),
+)
+
+MALFORMED_MAP_RESULTS = (
+    ("12h: a list result", ["out"]),
+    ("12i: a string result", "out"),
+    ("12j: a result with no out", {"code": 0}),
+    ("12k: out is not a list", {"code": 0, "out": {"piid": MAP_DATA_PIID}}),
+    ("12l: an entry that is not a mapping", {"out": ["raw"]}),
+    ("12m: an empty value", map_out((MAP_DATA_PIID, ""))),
+    ("12n: a non-string value", map_out((MAP_DATA_PIID, 5))),
+    ("12o: a non-numeric piid", {"out": [{"piid": "map", "value": "raw"}]}),
+    ("12p: an entry with no piid", {"out": [{"value": "raw"}]}),
+    ("12q: an unrecognised piid", map_out((999, "raw"))),
+    ("12r: OLD_MAP_DATA kind 1 with no name", map_out((OLD_MAP_DATA_PIID, "1,"))),
+    ("12s: OLD_MAP_DATA kind 0 with no map", map_out((OLD_MAP_DATA_PIID, "0,"))),
+    ("12t: an unknown OLD_MAP_DATA kind", map_out((OLD_MAP_DATA_PIID, "2,raw"))),
+)
+for label, response in MALFORMED_MAP_RESULTS:
+    source = _dreame._map_source(response)
+    check(f"{label} gives no map source", source == NO_SOURCE, detail=repr(source))
+
+MAP_DEVICE = 987654321
+FAKE_MAP_URL = "https://example.invalid/map?sig=FAKE"
+
+
+class StubResponse:
+    """Minimal requests response for the download call."""
+
+    def __init__(self, content, status_code=200):
+        self.content = content
+        self.status_code = status_code
+
+
+class MapStubCloud:
+    """Stand-in for the cloud object's map-related surface."""
+
+    def __init__(
+        self,
+        map_response,
+        url_available=True,
+        content=b"",
+        get_error=None,
+        status_code=200,
+    ):
+        self.device_id = MAP_DEVICE
+        # Only the indices the pinned URL call reads; none are real endpoints.
+        self._strings = [f"string{i}" for i in range(60)]
+        self._model = "fake.model"
+        self._country = "eu"
+        self.map_response = map_response
+        # The cloud returns the URL inside a data key, like upstream's
+        # get_interim_file_url does. url_available False means it gave nothing.
+        self.url_response = {"data": FAKE_MAP_URL} if url_available else None
+        self.content = content
+        self.get_error = get_error
+        self.status_code = status_code
+        self.sent = []
+        self.api_calls = []
+        self.gets = []
+        self._session = self
+
+    def send(self, method, parameters, retry_count=2, timeout=None):
+        self.sent.append(
+            {
+                "method": method,
+                "parameters": parameters,
+                "retry_count": retry_count,
+                "timeout": timeout,
+            }
+        )
+        return self.map_response
+
+    def _api_call(self, path, params=None, retry_count=2, timeout=None):
+        self.api_calls.append(
+            {
+                "path": path,
+                "params": params,
+                "retry_count": retry_count,
+                "timeout": timeout,
+            }
+        )
+        return self.url_response
+
+    def get(self, url, timeout=None):
+        self.gets.append({"url": url, "timeout": timeout})
+        if self.get_error is not None:
+            raise self.get_error
+        return StubResponse(self.content, self.status_code)
+
+
+def fetch_error(cloud, limit=None):
+    """Run fetch_rooms against a stub cloud; return the error text or the rooms."""
+    try:
+        return _dreame.fetch_rooms(cloud, _dreame.deadline() if limit is None else limit)
+    except ToolError as err:
+        return str(err)
+    except Exception as err:  # noqa: BLE001 - only ToolError may escape.
+        return f"raised {type(err).__name__}"
+
+
+def download_error(cloud, url):
+    """Run _download_map against a stub cloud; return the error text or the body."""
+    try:
+        return _dreame._download_map(cloud, url, _dreame.deadline())
+    except ToolError as err:
+        return str(err)
+    except Exception as err:  # noqa: BLE001 - only ToolError may escape.
+        return f"raised {type(err).__name__}"
+
+
+INLINE_MAP = map_text(NAMED_PIXELS, {"seg_inf": SEG_INF})
+PARTLY_USED_BUDGET = 10
+limit = time.monotonic() + PARTLY_USED_BUDGET
+cloud = MapStubCloud(map_out((MAP_DATA_PIID, INLINE_MAP)))
+check(
+    "12u: an inline map returns the rooms without URL or download calls",
+    fetch_error(cloud, limit) == EXPECTED_ROOMS
+    and cloud.api_calls == []
+    and cloud.gets == [],
+    detail=repr({"api_calls": cloud.api_calls, "gets": cloud.gets}),
+)
+action = cloud.sent[0]
+check(
+    "12v: the map action is one retry-free call inside the remaining budget",
+    len(cloud.sent) == 1
+    and action["method"] == "action"
+    and action["retry_count"] == 0
+    and isinstance(action["timeout"], float)
+    and 0 < action["timeout"] <= PARTLY_USED_BUDGET,
+    detail=repr(action),
+)
+
+limit = time.monotonic() + PARTLY_USED_BUDGET
+cloud = MapStubCloud(
+    map_out((OBJECT_NAME_PIID, f"mapobject,{ENCRYPTED_KEY}")),
+    content=ENCRYPTED_TEXT.encode("utf-8"),
+)
+rooms = fetch_error(cloud, limit)
+check(
+    "12w: a name,key object name splits and the encrypted map decodes",
+    rooms == EXPECTED_ROOMS,
+    detail=repr(rooms),
+)
+check(
+    "12x: the URL call receives the bare name, not name,key",
+    len(cloud.api_calls) == 1
+    and cloud.api_calls[0]["params"][cloud._strings[40]] == "mapobject",
+    detail=repr(cloud.api_calls),
+)
+check(
+    "12y: the URL and download calls are retry-free and inside the remaining budget",
+    cloud.api_calls[0]["retry_count"] == 0
+    and isinstance(cloud.api_calls[0]["timeout"], float)
+    and 0 < cloud.api_calls[0]["timeout"] <= PARTLY_USED_BUDGET
+    and len(cloud.gets) == 1
+    and cloud.gets[0]["url"] == FAKE_MAP_URL
+    and isinstance(cloud.gets[0]["timeout"], float)
+    and 0 < cloud.gets[0]["timeout"] <= PARTLY_USED_BUDGET,
+    detail=repr({"api_calls": cloud.api_calls, "gets": cloud.gets}),
+)
+
+cloud = MapStubCloud({"code": 0, "out": []})
+check(
+    "12z: a result with no map source is the fixed ToolError",
+    fetch_error(cloud) == _dreame.MAP_UNAVAILABLE_MESSAGE
+    and cloud.api_calls == []
+    and cloud.gets == [],
+    detail=repr({"api_calls": cloud.api_calls, "gets": cloud.gets}),
+)
+
+cloud = MapStubCloud(
+    map_out((OBJECT_NAME_PIID, "mapobject")), url_available=False
+)
+check(
+    "12aa: a missing file URL is the fixed ToolError",
+    fetch_error(cloud) == _dreame.MAP_UNAVAILABLE_MESSAGE
+    and len(cloud.api_calls) == 1
+    and cloud.gets == [],
+    detail=repr({"api_calls": cloud.api_calls, "gets": cloud.gets}),
+)
+
+cloud = MapStubCloud({}, get_error=RuntimeError(f"failed to fetch {FAKE_MAP_URL}"))
+message = download_error(cloud, FAKE_MAP_URL)
+check(
+    "12ab: a session exception is the fixed ToolError",
+    message == _dreame.MAP_UNAVAILABLE_MESSAGE,
+    detail=repr(message),
+)
+check(
+    "12ac: the signed URL does not leak into the download error",
+    "FAKE" not in message and "example.invalid" not in message,
+    detail=repr(message),
+)
+
+cloud = MapStubCloud({}, status_code=403, content=b"denied")
+message = download_error(cloud, FAKE_MAP_URL)
+check(
+    "12ad: a non-200 download is the fixed ToolError",
+    message == _dreame.MAP_UNAVAILABLE_MESSAGE,
+    detail=repr(message),
+)
+check(
+    "12ae: the signed URL does not leak from a non-200 response either",
+    "FAKE" not in message and "example.invalid" not in message,
+    detail=repr(message),
+)
+
+# An already-spent budget must fail before the first cloud call and must not be
+# reported as a map problem: the tool never asked the robot for anything.
+limit = time.monotonic() + _dreame.MINIMUM_REQUEST_TIMEOUT_SECONDS - 0.5
+cloud = MapStubCloud(map_out((MAP_DATA_PIID, INLINE_MAP)))
+message = fetch_error(cloud, limit)
+check(
+    "12af: a spent deadline raises the budget error before any call",
+    isinstance(message, str)
+    and "tool budget" in message
+    and cloud.sent == []
+    and cloud.api_calls == []
+    and cloud.gets == [],
+    detail=repr(
+        {
+            "message": message,
+            "sent": cloud.sent,
+            "api_calls": cloud.api_calls,
+            "gets": cloud.gets,
+        }
+    ),
+)
 
 # ---------------------------------------------------------------------------
 print()

@@ -1,0 +1,12 @@
+{
+  "name": "clean_rooms",
+  "description": "Start cleaning one or more chosen rooms with the Dreame vacuum. Call list_rooms first to get the room IDs. Does not choose the cleaning mode: when the user asks for a specific mode (for example to mop or to vacuum a room), call set_cleaning_mode before this tool. Uses the vacuum's current suction and water settings.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {
+    "rooms": {
+      "type": "array",
+      "description": "The IDs of the rooms to clean, as returned by list_rooms, for example [3, 5]."
+    }
+  }
+}

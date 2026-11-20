@@ -5,6 +5,8 @@ all cloud access here gives every tool the same configuration validation,
 credential-safe error handling, session cache, and deadline budget.
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -13,8 +15,11 @@ import sys
 import tempfile
 import time
 import types as _types
+import zlib
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from Crypto.Cipher import AES
 
 
 class ToolError(Exception):
@@ -48,6 +53,36 @@ VACUUM_UNREACHABLE_MESSAGE = (
 COMMAND_REFUSED_MESSAGE = (
     "The vacuum refused the command. It may be busy, or the feature is unsupported "
     "on this model."
+)
+
+MAP_UNAVAILABLE_MESSAGE = (
+    "The vacuum did not return a usable map with rooms, so no rooms could be listed. "
+    "Try again shortly."
+)
+
+MAP_HEADER_SIZE = 27
+
+# Map files are AES-CBC encrypted with a key derived from the file name. Upstream
+# picks the IV from a model table carried in const.py (DEVICE_INFO, entry [2]),
+# which this plugin does not download; keeping a copy of that model table would
+# also go stale for every new model. The 13 values are vendored here instead,
+# from upstream const.py DEVICE_INFO[2] at the pinned SHA
+# 3720223e11353aba622f8da34c9041586865aa48. Trying all of them is safe: a wrong
+# IV decrypts to noise, which zlib rejects on its checksum.
+MAP_AES_IVS = (
+    "qFKhvoAqRFTPfKN6",
+    "OFULk9To37qRdXY3",
+    "dndRQ3z8ACjDdDMo",
+    "NRwnBj5FsNPgBNbT",
+    "4sCv3Q2BtbWVBIB2",
+    "ojxGnogHfVuefVfx",
+    "3F0ji4ufBMaH1ThM",
+    "nf3Zi2Mq8jD5AAOm",
+    "FmnfaI2pbem0k75t",
+    "wRy05fYLQJMRH6Mj",
+    "RNO4p35b2QKaovHC",
+    "6PFiLPYMHLylp7RR",
+    "8qnS9dqgT3CppGe1",
 )
 
 
@@ -84,6 +119,8 @@ _UPSTREAM_ATTRIBUTE_NAMES = frozenset(
         "DreameVacuumAction",
         "DreameVacuumPropertyMapping",
         "DreameVacuumActionMapping",
+        "SEGMENT_TYPE_CODE_TO_NAME",
+        "DreameVacuumStatus",
     )
 )
 _upstream_bindings: dict[str, Any] | None = None
@@ -127,6 +164,8 @@ def _load_upstream() -> dict[str, Any]:
         "DreameVacuumAction": upstream_types.DreameVacuumAction,
         "DreameVacuumPropertyMapping": upstream_types.DreameVacuumPropertyMapping,
         "DreameVacuumActionMapping": upstream_types.DreameVacuumActionMapping,
+        "SEGMENT_TYPE_CODE_TO_NAME": upstream_types.SEGMENT_TYPE_CODE_TO_NAME,
+        "DreameVacuumStatus": upstream_types.DreameVacuumStatus,
     }
     cleaning_modes = {
         "sweep": upstream_types.DreameVacuumCleaningMode.SWEEPING.value,
@@ -525,34 +564,291 @@ def read_whole_number(props: Mapping[tuple[int, int], Any], address: Mapping[str
 def set_prop(cloud: Any, address: Mapping[str, int], value: Any, limit: float) -> Any:
     """Set one MIoT property without upstream retries that exceed the budget."""
     siid, piid = _property_parts(address)
-    response = _send(
+    return set_props(
         cloud,
-        "set_properties",
-        [
-            {
-                "did": str(cloud.device_id),
-                "siid": siid,
-                "piid": piid,
-                "value": value,
-            }
-        ],
+        [{"did": str(cloud.device_id), "siid": siid, "piid": piid, "value": value}],
         limit,
     )
+
+
+def set_props(cloud: Any, payload: list[Mapping[str, Any]], limit: float) -> Any:
+    """Set several MIoT properties in one call, without upstream retries."""
+    response = _send(cloud, "set_properties", payload, limit)
     _raise_if_refused(response)
     return response
 
 
-def run_action(cloud: Any, address: Mapping[str, int], limit: float) -> Any:
+def run_action(
+    cloud: Any,
+    address: Mapping[str, int],
+    limit: float,
+    inputs: list[Mapping[str, Any]] | None = None,
+) -> Any:
     """Run one MIoT action without upstream retries that exceed the budget."""
     siid, aiid = _action_parts(address)
     response = _send(
         cloud,
         "action",
-        {"did": str(cloud.device_id), "siid": siid, "aiid": aiid, "in": []},
+        {
+            "did": str(cloud.device_id),
+            "siid": siid,
+            "aiid": aiid,
+            "in": [] if inputs is None else inputs,
+        },
         limit,
     )
     _raise_if_refused(response)
     return response
+
+
+def _property_piid(name: str) -> int:
+    """Return one property's piid, loading upstream on first use."""
+    _load_upstream()
+    return _property_parts(DreameVacuumPropertyMapping[DreameVacuumProperty[name]])[1]
+
+
+def request_map(cloud: Any, limit: float) -> Any:
+    """Ask the robot for an I-frame map and return the action result."""
+    _load_upstream()
+    # Same request upstream sends from _request_i_map (map.py:300): a forced
+    # I frame, which is the frame that carries a saved map. Compact separators
+    # keep the value byte-for-byte what the robot expects.
+    payload = json.dumps(
+        {"req_type": 1, "frame_type": "I", "force_type": 1}, separators=(",", ":")
+    )
+    return run_action(
+        cloud,
+        DreameVacuumActionMapping[DreameVacuumAction.REQUEST_MAP],
+        limit,
+        [{"piid": _property_piid("FRAME_INFO"), "value": payload}],
+    )
+
+
+def _map_source(response: Any) -> tuple[str | None, str | None, str | None]:
+    """Return (inline map text, object name, key) from a REQUEST_MAP result."""
+    if not isinstance(response, Mapping):
+        return None, None, None
+    out = response.get("out")
+    if not isinstance(out, list):
+        return None, None, None
+
+    object_piid = _property_piid("OBJECT_NAME")
+    map_piid = _property_piid("MAP_DATA")
+    old_map_piid = _property_piid("OLD_MAP_DATA")
+
+    object_name = None
+    raw_map = None
+    old_map = None
+    for prop in out:
+        if not isinstance(prop, Mapping):
+            continue
+        value = prop.get("value")
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            piid = int(prop.get("piid"))
+        except (TypeError, ValueError):
+            continue
+        if piid == object_piid:
+            object_name = value
+        elif piid == map_piid:
+            raw_map = value
+        elif piid == old_map_piid:
+            old_map = value
+
+    # An inline map is complete on its own, so it wins and the two cloud calls
+    # for a file are skipped. OLD_MAP_DATA is a fallback only.
+    if raw_map:
+        return raw_map, None, None
+    if object_name:
+        return None, object_name, None
+    if old_map:
+        kind, _, rest = old_map.partition(",")
+        if kind == "0" and rest:
+            return rest, None, None
+        if kind == "1" and rest:
+            name, _, key = rest.partition(",")
+            if name:
+                return None, name, key or None
+    return None, None, None
+
+
+def _interim_file_url(cloud: Any, object_name: str, limit: float) -> str | None:
+    """Resolve a map file name to a download URL without upstream retries."""
+    # upstream get_interim_file_url() (protocol.py:653) leaves retry_count at 2
+    # and carries no timeout of its own. Same endpoint, same string indices,
+    # one attempt, timeout from the remaining budget. Indices track the pinned
+    # SHA, like _get_devices above.
+    path = "/".join((cloud._strings[23], cloud._strings[39], cloud._strings[55]))
+    params = {
+        "did": str(cloud.device_id),
+        cloud._strings[35]: getattr(cloud, "_model", None),
+        cloud._strings[40]: object_name,
+        cloud._strings[21]: getattr(cloud, "_country", None),
+    }
+    response = cloud._api_call(path, params, 0, timeout_remaining(limit))
+    if isinstance(response, Mapping):
+        data = response.get("data")
+        if isinstance(data, str) and data:
+            return data
+    return None
+
+
+def _download_map(cloud: Any, url: str, limit: float) -> str:
+    """Fetch map text with the cloud's session: one GET, deadline-bounded."""
+    request_timeout = timeout_remaining(limit)
+    try:
+        response = cloud._session.get(url, timeout=request_timeout)
+    except Exception:
+        # requests wraps socket errors, timeouts and bad URLs in many types;
+        # none of them may carry a signed URL into the user-facing output.
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE) from None
+    if response is None or response.status_code != 200:
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE)
+    try:
+        return response.content.decode("utf-8")
+    except (AttributeError, UnicodeDecodeError):
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE) from None
+
+
+def fetch_rooms(cloud: Any, limit: float) -> list[dict]:
+    """Ask the robot for its saved map and return its rooms sorted by ID.
+
+    Four cloud calls: the login inside connect(), REQUEST_MAP, the file URL and
+    the file. That is one more than the plugin's usual three-call rule, but a
+    map cannot be had in fewer: the robot answers with a file name and the URL
+    has to be resolved separately. The inline-map path skips the last two. All
+    calls are deadline-bounded and none retries upstream-style.
+    """
+    raw_map, object_name, key = _map_source(request_map(cloud, limit))
+    if raw_map is not None:
+        return map_rooms(raw_map, key)
+    if object_name is None:
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE)
+
+    if key is None and "," in object_name:
+        object_name, key = object_name.split(",", 1)
+
+    url = _interim_file_url(cloud, object_name, limit)
+    if url is None:
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE)
+    return map_rooms(_download_map(cloud, url, limit), key or None)
+
+
+def _decode_map_payload(raw_text: str, key: str | None = None) -> tuple[bytes, dict]:
+    """Decode one map payload into (pixel bytes, metadata JSON)."""
+    if not isinstance(raw_text, str):
+        raise ValueError("map payload is not text")
+    text = raw_text.replace("_", "/").replace("-", "+").strip()
+    if len(text) < 3:
+        raise ValueError("map payload is too short")
+    if key is None and "," in text:
+        text, key = text.split(",", 1)
+
+    payload = base64.b64decode(text + "=" * (-len(text) % 4), validate=False)
+    if key is None:
+        raw = zlib.decompress(payload)
+    else:
+        aes_key = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32].encode("ascii")
+        raw = None
+        for iv in MAP_AES_IVS:
+            try:
+                raw = zlib.decompress(
+                    AES.new(aes_key, AES.MODE_CBC, iv.encode("ascii")).decrypt(payload)
+                )
+            except (ValueError, zlib.error):
+                continue
+            break
+        if raw is None:
+            raise ValueError("no IV decrypts the map")
+
+    if len(raw) < MAP_HEADER_SIZE:
+        raise ValueError("map header is too short")
+    width = int.from_bytes(raw[19:21], "little", signed=True)
+    height = int.from_bytes(raw[21:23], "little", signed=True)
+    if width <= 0 or height <= 0:
+        raise ValueError("map has no pixels")
+
+    image_end = MAP_HEADER_SIZE + width * height
+    if image_end > len(raw):
+        raise ValueError("map is shorter than its dimensions")
+    data_json = json.loads(raw[image_end:].decode("utf-8"))
+    if not isinstance(data_json, dict):
+        raise ValueError("map metadata is not an object")
+    return raw[MAP_HEADER_SIZE:image_end], data_json
+
+
+def _whole_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _custom_room_name(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        name = base64.b64decode(value, validate=False).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return name or None
+
+
+def _rooms_in_map(pixels: bytes, data_json: Mapping[str, Any]) -> list[dict]:
+    """Build the room list from one decoded map frame or saved map."""
+    type_names = _load_upstream()["SEGMENT_TYPE_CODE_TO_NAME"]
+    seg_inf = data_json.get("seg_inf")
+    if not isinstance(seg_inf, Mapping):
+        seg_inf = {}
+
+    rooms = []
+    for segment_id in sorted({pixel & 0x3F for pixel in pixels} - {0}):
+        details = seg_inf.get(str(segment_id))
+        if not isinstance(details, Mapping):
+            details = {}
+        room_type = _whole_int(details.get("type")) or 0
+        index = _whole_int(details.get("index")) or 0
+
+        # Mirrors Segment.set_name (types.py:3680): a known type wins and is
+        # numbered only for repeated types, then a custom name, then the ID.
+        type_name = type_names.get(room_type) if room_type != 0 else None
+        if type_name:
+            name = type_name if index <= 0 else f"{type_name} {index + 1}"
+        else:
+            name = _custom_room_name(details.get("name")) or f"Room {segment_id}"
+        rooms.append({"id": segment_id, "name": name})
+    return rooms
+
+
+def map_rooms(raw_text: str, key: str | None = None) -> list[dict]:
+    """Decode map text and return its rooms sorted by ID, without cloud access.
+
+    The bytes come from the cloud and are untrusted, so every malformed input
+    becomes the one fixed ToolError instead of an exception from base64, AES,
+    zlib or JSON escaping into the tool.
+    """
+    try:
+        pixels, data_json = _decode_map_payload(raw_text, key)
+        if "rism" in data_json:
+            # rism is the saved map nested in a live frame, in the same
+            # encoding and never encrypted. The saved map is the one with the
+            # rooms the app shows, so it replaces the frame's own pixels.
+            rism = data_json["rism"]
+            if not isinstance(rism, str):
+                raise ValueError("saved map is not text")
+            pixels, data_json = _decode_map_payload(rism)
+        rooms = _rooms_in_map(pixels, data_json)
+    except ToolError:
+        raise
+    except Exception:
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE) from None
+
+    if not rooms:
+        raise ToolError(MAP_UNAVAILABLE_MESSAGE)
+    return rooms
 
 
 def decode(enum_cls: Any, value: Any) -> str:
@@ -642,6 +938,161 @@ def decode_cleaning_mode(raw_value: int, lifting: bool) -> str:
     wire_mode = raw_value & 0x03
     logical_mode = {0: 2, 2: 0}.get(wire_mode, wire_mode) if lifting else wire_mode
     return _CLEANING_MODE_NAMES[logical_mode]
+
+
+SMART_HOST_KEY = "SmartHost"
+
+# Upstream writes a single changed setting rather than the whole list, and it
+# has to be byte-identical to what the app sends: no spaces, plain JSON.
+CLEAN_GENIUS_OFF_VALUE = '{"k":"SmartHost","v":0}'
+
+
+def clean_genius_on(auto_switch_settings: Any) -> bool:
+    """Report whether CleanGenius is on in a raw AUTO_SWITCH_SETTINGS value.
+
+    The value is a JSON string holding a list of {"k", "v"} objects, or a
+    single such object on some models. Anything unreadable or without a usable
+    SmartHost entry means "no CleanGenius on this model" rather than an error:
+    the setting is optional and only a positive value turns it on.
+    """
+    if not isinstance(auto_switch_settings, str) or len(auto_switch_settings) <= 2:
+        return False
+    try:
+        settings = json.loads(auto_switch_settings)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(settings, Mapping):
+        settings = [settings]
+    if not isinstance(settings, list):
+        return False
+
+    value = None
+    for setting in settings:
+        if isinstance(setting, Mapping) and setting.get("k") == SMART_HOST_KEY:
+            value = setting.get("v")
+    # Booleans are ints in Python, and a bool is not a documented value here.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value > 0
+
+
+def cleaning_mode_write_plan(
+    device_id: Any,
+    packed_value: int,
+    mode_name: str,
+    lifting: bool,
+    auto_switch_settings: Any,
+) -> dict:
+    """Build the one set_properties payload for changing the cleaning mode.
+
+    Returns the exact payload, whether the mode itself changes, and whether
+    CleanGenius is being turned off. A requested mode must take effect, so
+    CleanGenius is cleared in the same call: on its own it makes the robot
+    ignore the mode. The mode entry is omitted when the packed value already
+    matches, but the CleanGenius entry still has to go out in that case.
+    """
+    _load_upstream()
+    mode_address = DreameVacuumPropertyMapping[DreameVacuumProperty.CLEANING_MODE]
+    auto_address = DreameVacuumPropertyMapping[
+        DreameVacuumProperty.AUTO_SWITCH_SETTINGS
+    ]
+    did = str(device_id)
+
+    new_packed = encode_cleaning_mode(packed_value, mode_name, lifting)
+    changed = new_packed != packed_value
+    clean_genius_off = clean_genius_on(auto_switch_settings)
+
+    payload = []
+    if changed:
+        payload.append(
+            {
+                "did": did,
+                "siid": mode_address["siid"],
+                "piid": mode_address["piid"],
+                "value": new_packed,
+            }
+        )
+    if clean_genius_off:
+        payload.append(
+            {
+                "did": did,
+                "siid": auto_address["siid"],
+                "piid": auto_address["piid"],
+                "value": CLEAN_GENIUS_OFF_VALUE,
+            }
+        )
+    return {
+        "payload": payload,
+        "changed": changed,
+        "clean_genius_off": clean_genius_off,
+    }
+
+
+ROOMS_PARAMETER_MESSAGE = (
+    "The rooms parameter must be a non-empty array of room IDs (integers from 1 to 63). "
+    "Use list_rooms to get the IDs."
+)
+
+
+def parse_room_ids(parameters: Any) -> list[int]:
+    """Validate the rooms parameter and return its IDs, de-duplicated in order."""
+    if not isinstance(parameters, Mapping):
+        raise ToolError(ROOMS_PARAMETER_MESSAGE)
+    rooms = parameters.get("rooms")
+    if not isinstance(rooms, list) or not rooms:
+        raise ToolError(ROOMS_PARAMETER_MESSAGE)
+
+    room_ids = []
+    seen = set()
+    for room_id in rooms:
+        # bool is an int subclass, but True is not a room ID.
+        if isinstance(room_id, bool) or not isinstance(room_id, int):
+            raise ToolError(ROOMS_PARAMETER_MESSAGE)
+        if not 1 <= room_id <= 63:
+            raise ToolError(ROOMS_PARAMETER_MESSAGE)
+        if room_id not in seen:
+            seen.add(room_id)
+            room_ids.append(room_id)
+    return room_ids
+
+
+def clean_rooms_inputs(
+    room_ids: list[int],
+    suction_level: int,
+    water_volume: int,
+    customized_cleaning: bool,
+) -> list[dict]:
+    """Build the two START_CUSTOM inputs for cleaning the given rooms.
+
+    Each select is [room ID, repeats, suction, water, order]. Upstream sends
+    order=1 for every room whenever the robot supports customized cleaning;
+    any other value breaks newer models. Otherwise order is the 1-based
+    position in the request.
+    """
+    _load_upstream()
+    status_address = DreameVacuumPropertyMapping[DreameVacuumProperty.STATUS]
+    properties_address = DreameVacuumPropertyMapping[
+        DreameVacuumProperty.CLEANING_PROPERTIES
+    ]
+
+    selects = [
+        [
+            room_id,
+            1,
+            suction_level,
+            water_volume,
+            1 if customized_cleaning else position,
+        ]
+        for position, room_id in enumerate(room_ids, start=1)
+    ]
+    value = json.dumps({"selects": selects}, separators=(",", ":"))
+    return [
+        {
+            "piid": status_address["piid"],
+            "value": DreameVacuumStatus.SEGMENT_CLEANING.value,
+        },
+        {"piid": properties_address["piid"], "value": value},
+    ]
 
 
 def main_guard(main: Callable[[], None]) -> None:

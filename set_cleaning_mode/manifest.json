@@ -1,6 +1,6 @@
 {
   "name": "set_cleaning_mode",
-  "description": "Set the cleaning mode the Dreame vacuum will use. This only changes the mode setting, it does not start a clean.",
+  "description": "Set the cleaning mode the Dreame vacuum will use, for a whole-house clean or a room clean. This only changes settings, it does not start a clean. If CleanGenius (the vacuum's automatic mode, which ignores the manual mode) is on, this turns it off so that the chosen mode takes effect, and the result says so.",
   "entrypoint": "run.py",
   "async": false,
   "parameters": {

@@ -1,0 +1,7 @@
+{
+  "name": "list_rooms",
+  "description": "List the rooms on the Dreame vacuum's saved map, with the ID and name of each. Call this before clean_rooms, which takes these IDs. This only reads the map; it changes nothing on the vacuum.",
+  "entrypoint": "run.py",
+  "async": false,
+  "parameters": {}
+}

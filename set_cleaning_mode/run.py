@@ -20,8 +20,14 @@ import _dreame
 # self-clean value and bits 16-17 the water level, so a blind write of a bare
 # mode number would wipe them. SELF_WASH_BASE_STATUS and DUST_COLLECTION are
 # presence probes for mop-pad-lifting detection, which decides whether the
-# sweep and sweep-and-mop wire values are swapped.
-PROPERTY_NAMES = ("CLEANING_MODE", "SELF_WASH_BASE_STATUS", "DUST_COLLECTION")
+# sweep and sweep-and-mop wire values are swapped. AUTO_SWITCH_SETTINGS is
+# read only to see whether CleanGenius is on; it is never rewritten as a whole.
+PROPERTY_NAMES = (
+    "CLEANING_MODE",
+    "SELF_WASH_BASE_STATUS",
+    "DUST_COLLECTION",
+    "AUTO_SWITCH_SETTINGS",
+)
 
 MODE_NAMES_MESSAGE = "Choose one of: sweep, mop, sweep_and_mop, mop_after_sweep."
 
@@ -37,11 +43,32 @@ UNCHANGED_NOTE = (
     "this tool touches; use start_cleaning to begin a job with it."
 )
 
+CHANGED_CLEAN_GENIUS_NOTE = (
+    "This changed the cleaning mode setting and turned CleanGenius off, because CleanGenius "
+    "makes the robot ignore the manual mode. CleanGenius stays off until you turn it back on "
+    "in the app. The vacuum was not sent out to clean; use start_cleaning to begin a job with "
+    "this mode."
+)
+
+UNCHANGED_CLEAN_GENIUS_NOTE = (
+    "The vacuum was already in this mode, so the mode setting was not changed. CleanGenius was "
+    "on and has been turned off, because it makes the robot ignore the manual mode. CleanGenius "
+    "stays off until you turn it back on in the app. Use start_cleaning to begin a job with "
+    "this mode."
+)
+
 UNREADABLE_MODE_MESSAGE = (
     "The Dreame cloud could not read the vacuum's current cleaning mode. Setting a new mode "
     "without it would wipe the water level and self-clean settings, so nothing was changed. "
     "Try again shortly."
 )
+
+
+def result_note(changed, clean_genius_off):
+    """Pick the note that says exactly what the tool did and did not change."""
+    if clean_genius_off:
+        return CHANGED_CLEAN_GENIUS_NOTE if changed else UNCHANGED_CLEAN_GENIUS_NOTE
+    return CHANGED_NOTE if changed else UNCHANGED_NOTE
 
 
 def requested_mode():
@@ -92,19 +119,26 @@ def main() -> None:
         raise _dreame.ToolError(UNREADABLE_MODE_MESSAGE)
 
     lifting = _dreame.detect_mop_pad_lifting(properties)
-    new_packed = _dreame.encode_cleaning_mode(packed, mode, lifting)
+    plan = _dreame.cleaning_mode_write_plan(
+        cloud.device_id,
+        packed,
+        mode,
+        lifting,
+        _dreame.read_property(properties, mapping[enum.AUTO_SWITCH_SETTINGS]),
+    )
 
-    # An identical value would be a provable no-op on the robot, so that write
-    # is skipped rather than spent: it is the third of three round trips.
-    changed = new_packed != packed
-    if changed:
-        _dreame.set_prop(cloud, cleaning_mode, new_packed, limit)
+    # One call carries both writes when CleanGenius has to go too. An identical
+    # mode value alone would be a provable no-op, so that entry is omitted, but
+    # turning CleanGenius off is never skipped.
+    if plan["payload"]:
+        _dreame.set_props(cloud, plan["payload"], limit)
 
     json.dump(
         {
             "mode": mode,
-            "changed": changed,
-            "note": CHANGED_NOTE if changed else UNCHANGED_NOTE,
+            "changed": plan["changed"],
+            "clean_genius_off": plan["clean_genius_off"],
+            "note": result_note(plan["changed"], plan["clean_genius_off"]),
         },
         sys.stdout,
     )
