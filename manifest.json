@@ -11,11 +11,13 @@
     "account_type": {
       "description": "Which phone app your vacuum is registered in. \"dreame\", \"mova\", or \"trouver\".",
       "required": false,
-      "default": "dreame"
+      "default": "dreame",
+      "secret": false
     },
     "username": {
       "description": "The email address you log into that app with.",
-      "required": true
+      "required": true,
+      "secret": false
     },
     "password": {
       "description": "The password for that account.",
@@ -24,7 +26,8 @@
     "country": {
       "description": "The region your account was created in: eu, us, cn, sg, ru, or kr.",
       "required": false,
-      "default": "eu"
+      "default": "eu",
+      "secret": false
     }
   }
 }
