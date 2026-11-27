@@ -12,12 +12,17 @@
       "description": "Which phone app your vacuum is registered in. \"dreame\", \"mova\", or \"trouver\".",
       "required": false,
       "default": "dreame",
-      "secret": false
+      "type": "select",
+      "options": [
+        "dreame",
+        "mova",
+        "trouver"
+      ]
     },
     "username": {
       "description": "The email address you log into that app with.",
       "required": true,
-      "secret": false
+      "type": "text"
     },
     "password": {
       "description": "The password for that account.",
@@ -27,7 +32,15 @@
       "description": "The region your account was created in: eu, us, cn, sg, ru, or kr.",
       "required": false,
       "default": "eu",
-      "secret": false
+      "type": "select",
+      "options": [
+        "eu",
+        "us",
+        "cn",
+        "sg",
+        "ru",
+        "kr"
+      ]
     }
   }
 }
